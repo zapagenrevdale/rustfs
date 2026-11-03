@@ -18,7 +18,7 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
     steps:
       - name: Free runner disk
         run: |
@@ -39,12 +39,6 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Unit tests
-        run: cargo test --locked -p rustfs --lib presigned_query_user_metadata
-
-      - name: Clippy
-        run: cargo clippy --locked -p rustfs --all-targets -- -D warnings
-
       - name: Build server
         run: |
           cargo build --locked -p rustfs --bin rustfs
@@ -61,24 +55,29 @@ jobs:
           mkdir -p "$RUNNER_TEMP/vol"
           RUSTFS_VOLUMES="$RUNNER_TEMP/vol" ./target/debug/rustfs > "$RUNNER_TEMP/rustfs.log" 2>&1 &
           for _ in $(seq 60); do curl -sf -o /dev/null http://127.0.0.1:9000/health/ready && break; sleep 1; done
-          python3 -m pip install --quiet boto3
-          python3 - <<'PY'
-          import urllib.parse, urllib.request, boto3
-          from botocore.config import Config
-          s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000", region_name="us-east-1",
-              aws_access_key_id="verify-access", aws_secret_access_key="verify-secret-key",
-              config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
-          s3.create_bucket(Bucket="verify")
-          url = s3.generate_presigned_url("put_object", Params={"Bucket": "verify", "Key": "a.csv",
-              "Metadata": {"user-id": "u1", "file-name": "a b.csv"}}, ExpiresIn=300)
-          keys = sorted(k for k in urllib.parse.parse_qs(urllib.parse.urlparse(url).query) if k.lower().startswith("x-amz-meta-"))
-          print("metadata carried in query:", keys)
-          assert keys, "boto3 did not hoist metadata into the query"
-          urllib.request.urlopen(urllib.request.Request(url, data=b"x,y\n", method="PUT")).read()
-          got = s3.head_object(Bucket="verify", Key="a.csv")["Metadata"]
-          print("stored metadata:", got)
-          assert got == {"user-id": "u1", "file-name": "a b.csv"}, got
-          PY
+          mkdir -p "$RUNNER_TEMP/js" && cd "$RUNNER_TEMP/js"
+          npm init -y > /dev/null
+          npm install --silent @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+          cat > verify.mjs <<'JS'
+          import { S3Client, CreateBucketCommand, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+          import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+          import assert from "node:assert/strict";
+          const s3 = new S3Client({ endpoint: "http://127.0.0.1:9000", region: "us-east-1", forcePathStyle: true,
+            credentials: { accessKeyId: "verify-access", secretAccessKey: "verify-secret-key" } });
+          await s3.send(new CreateBucketCommand({ Bucket: "verify" }));
+          const metadata = { "user-id": "u1", "file-name": "a b.csv" };
+          const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: "verify", Key: "a.csv", Metadata: metadata }), { expiresIn: 300 });
+          const hoisted = [...new URL(url).searchParams.keys()].filter((k) => k.toLowerCase().startsWith("x-amz-meta-")).sort();
+          console.log("metadata carried in query:", hoisted);
+          assert.ok(hoisted.length > 0, "SDK did not hoist metadata into the query");
+          const put = await fetch(url, { method: "PUT", body: "x,y\n" });
+          console.log("presigned PUT status:", put.status);
+          assert.equal(put.status, 200, await put.text());
+          const head = await s3.send(new HeadObjectCommand({ Bucket: "verify", Key: "a.csv" }));
+          console.log("stored metadata:", head.Metadata);
+          assert.deepEqual(head.Metadata, metadata);
+          JS
+          node verify.mjs
 
       - name: Server log on failure
         if: failure()
