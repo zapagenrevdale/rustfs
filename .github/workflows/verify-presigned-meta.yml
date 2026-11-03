@@ -18,7 +18,7 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - name: Free runner disk
         run: |
@@ -38,6 +38,12 @@ jobs:
 
       - name: Format
         run: cargo fmt --all --check
+
+      - name: Unit tests
+        run: cargo test --locked -p rustfs --lib presigned_query_user_metadata
+
+      - name: Clippy
+        run: cargo clippy --locked -p rustfs --all-targets -- -D warnings
 
       - name: Build server
         run: |
