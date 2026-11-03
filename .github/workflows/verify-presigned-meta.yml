@@ -1,6 +1,6 @@
 # Throwaway fork-only lane: verifies fix/presigned-query-metadata on a
 # GitHub-hosted runner, since ci.yml's compile lanes need self-hosted runners.
-name: Verify presigned query metadata
+name: Verify presigned query metadata (baseline)
 
 on:
   push:
@@ -29,6 +29,7 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+          ref: cc08e0d11bf944f529d14149eb91286a21d3915f
 
       - uses: ./.github/actions/setup
         with:
@@ -36,21 +37,12 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Unit tests
-        run: cargo test --locked -p rustfs --lib presigned_query_user_metadata
-
-      - name: Clippy
-        run: cargo clippy --locked -p rustfs --all-targets -- -D warnings
-
       - name: Build server
         run: |
           cargo build --locked -p rustfs --bin rustfs
           df -h /
 
-      - name: Presigned PUT keeps x-amz-meta-* end to end
+      - name: Base commit drops presigned query metadata
         env:
           RUSTFS_ACCESS_KEY: verify-access
           RUSTFS_SECRET_KEY: verify-secret-key
@@ -81,7 +73,7 @@ jobs:
           assert.equal(put.status, 200, await put.text());
           const head = await s3.send(new HeadObjectCommand({ Bucket: "verify", Key: "a.csv" }));
           console.log("stored metadata:", head.Metadata);
-          assert.deepEqual(head.Metadata, metadata);
+          assert.deepEqual(head.Metadata ?? {}, {}, "base commit unexpectedly kept query metadata");
           JS
           node verify.mjs
 
