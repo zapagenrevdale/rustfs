@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
-use http::HeaderMap;
 use http::Uri;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
@@ -1349,6 +1349,8 @@ const USER_METADATA_QUERY_PREFIX: &str = "x-amz-meta-";
 ///
 /// # Errors
 ///
+/// Returns `InvalidArgument` when a name or value could not have been sent as
+/// an HTTP header, since HEAD and GET return stored metadata as headers.
 /// Returns `InvalidRequest` when a metadata key repeats in the query or also
 /// arrives as an `x-amz-meta-*` header, mirroring the duplicate-header rule for
 /// header metadata.
@@ -1367,6 +1369,12 @@ pub(crate) fn parse_presigned_query_user_metadata(
         let Some(key) = name.strip_prefix(USER_METADATA_QUERY_PREFIX).filter(|key| !key.is_empty()) else {
             continue;
         };
+        if HeaderName::from_bytes(name.as_bytes()).is_err() || HeaderValue::from_str(&value).is_err() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                format!("user metadata {name} is not a valid header name or value"),
+            ));
+        }
         if header.contains_key(name.as_str()) || metadata.insert(key.to_owned(), value.into_owned()).is_some() {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -2460,6 +2468,17 @@ mod tests {
         header.insert("x-amz-meta-a", HeaderValue::from_static("1"));
         let shadowed = parse_presigned_query_user_metadata(&header, Some("x-amz-meta-a=2"), true);
         assert_eq!(shadowed.unwrap_err().code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn presigned_query_user_metadata_rejects_values_that_cannot_be_headers() {
+        for query in ["x-amz-meta-a%20b=1", "x-amz-meta-a=line%0Abreak", "x-amz-meta-a=%7F"] {
+            let invalid = parse_presigned_query_user_metadata(&HeaderMap::new(), Some(query), true);
+            assert_eq!(invalid.unwrap_err().code(), &S3ErrorCode::InvalidArgument, "{query}");
+        }
+
+        let utf8 = parse_presigned_query_user_metadata(&HeaderMap::new(), Some("x-amz-meta-name=caf%C3%A9"), true).unwrap();
+        assert_eq!(utf8.get("name").map(String::as_str), Some("café"));
     }
 
     #[test]
