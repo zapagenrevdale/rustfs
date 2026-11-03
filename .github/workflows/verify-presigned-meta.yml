@@ -1,0 +1,85 @@
+# Throwaway fork-only lane: verifies fix/presigned-query-metadata on a
+# GitHub-hosted runner, since ci.yml's compile lanes need self-hosted runners.
+name: Verify presigned query metadata
+
+on:
+  push:
+    branches: [ ci/verify-presigned-meta ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Unit tests
+        run: cargo test --locked -p rustfs --lib presigned_query_user_metadata
+
+      - name: Clippy
+        run: cargo clippy --locked -p rustfs --all-targets -- -D warnings
+
+      - name: Build server
+        run: |
+          cargo build --locked -p rustfs --bin rustfs
+          df -h /
+
+      - name: Presigned PUT keeps x-amz-meta-* end to end
+        env:
+          RUSTFS_ACCESS_KEY: verify-access
+          RUSTFS_SECRET_KEY: verify-secret-key
+          RUSTFS_ADDRESS: 127.0.0.1:9000
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+        run: |
+          mkdir -p "$RUNNER_TEMP/vol"
+          RUSTFS_VOLUMES="$RUNNER_TEMP/vol" ./target/debug/rustfs > "$RUNNER_TEMP/rustfs.log" 2>&1 &
+          for _ in $(seq 60); do curl -sf -o /dev/null http://127.0.0.1:9000/health/ready && break; sleep 1; done
+          python3 -m pip install --quiet boto3
+          python3 - <<'PY'
+          import urllib.parse, urllib.request, boto3
+          from botocore.config import Config
+          s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000", region_name="us-east-1",
+              aws_access_key_id="verify-access", aws_secret_access_key="verify-secret-key",
+              config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+          s3.create_bucket(Bucket="verify")
+          url = s3.generate_presigned_url("put_object", Params={"Bucket": "verify", "Key": "a.csv",
+              "Metadata": {"user-id": "u1", "file-name": "a b.csv"}}, ExpiresIn=300)
+          keys = sorted(k for k in urllib.parse.parse_qs(urllib.parse.urlparse(url).query) if k.lower().startswith("x-amz-meta-"))
+          print("metadata carried in query:", keys)
+          assert keys, "boto3 did not hoist metadata into the query"
+          urllib.request.urlopen(urllib.request.Request(url, data=b"x,y\n", method="PUT")).read()
+          got = s3.head_object(Bucket="verify", Key="a.csv")["Metadata"]
+          print("stored metadata:", got)
+          assert got == {"user-id": "u1", "file-name": "a b.csv"}, got
+          PY
+
+      - name: Server log on failure
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/rustfs.log" || true
