@@ -1336,6 +1336,48 @@ pub(crate) fn parse_presigned_put_max_content_length(
     Ok(Some(limit))
 }
 
+const USER_METADATA_QUERY_PREFIX: &str = "x-amz-meta-";
+
+/// Collect `x-amz-meta-*` user metadata carried in a SigV4 presigned query.
+///
+/// AWS SDK presigners hoist PutObject metadata into the query string unless the
+/// caller marks it unhoistable, and AWS S3 stores it as object metadata. The
+/// presigned signature covers every query parameter, so these values are as
+/// authenticated as signed headers. Returns an empty map unless the request was
+/// verified as presigned. Keys are lowercased like header names; values are the
+/// percent-decoded query values.
+///
+/// # Errors
+///
+/// Returns `InvalidRequest` when a metadata key repeats in the query or also
+/// arrives as an `x-amz-meta-*` header, mirroring the duplicate-header rule for
+/// header metadata.
+pub(crate) fn parse_presigned_query_user_metadata(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_presigned: bool,
+) -> S3Result<HashMap<String, String>> {
+    let mut metadata = HashMap::new();
+    let Some(query) = query.filter(|_| verified_presigned) else {
+        return Ok(metadata);
+    };
+
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+        let name = name.to_ascii_lowercase();
+        let Some(key) = name.strip_prefix(USER_METADATA_QUERY_PREFIX).filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        if header.contains_key(name.as_str()) || metadata.insert(key.to_owned(), value.into_owned()).is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("user metadata {name} must appear exactly once"),
+            ));
+        }
+    }
+
+    Ok(metadata)
+}
+
 /// Reject the PutObject-only size capability when it appears on another
 /// operation. Callers must invoke this after request authentication has run.
 pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
@@ -2382,6 +2424,42 @@ mod tests {
         let result = get_query_param(query, "param1");
 
         assert_eq!(result, Some("value=with=equals"));
+    }
+
+    #[test]
+    fn presigned_query_user_metadata_is_read_only_from_verified_presigned_requests() {
+        let query = Some("X-Amz-Signature=abc&x-amz-meta-user-id=u1&X-Amz-Meta-File-Name=a%20b.csv&x-amz-meta-=ignored&prefix=x");
+
+        let metadata = parse_presigned_query_user_metadata(&HeaderMap::new(), query, true).unwrap();
+        assert_eq!(
+            metadata,
+            HashMap::from([
+                ("user-id".to_owned(), "u1".to_owned()),
+                ("file-name".to_owned(), "a b.csv".to_owned()),
+            ])
+        );
+
+        assert!(
+            parse_presigned_query_user_metadata(&HeaderMap::new(), query, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_presigned_query_user_metadata(&HeaderMap::new(), None, true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn presigned_query_user_metadata_rejects_repeated_keys() {
+        let repeated = parse_presigned_query_user_metadata(&HeaderMap::new(), Some("x-amz-meta-a=1&X-Amz-Meta-A=2"), true);
+        assert_eq!(repeated.unwrap_err().code(), &S3ErrorCode::InvalidRequest);
+
+        let mut header = HeaderMap::new();
+        header.insert("x-amz-meta-a", HeaderValue::from_static("1"));
+        let shadowed = parse_presigned_query_user_metadata(&header, Some("x-amz-meta-a=2"), true);
+        assert_eq!(shadowed.unwrap_err().code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]

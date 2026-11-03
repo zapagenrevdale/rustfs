@@ -17,7 +17,10 @@
 use super::*;
 
 use crate::app::trailer_adapter::trailer_source;
-use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
+use crate::auth::{
+    RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length,
+    parse_presigned_query_user_metadata,
+};
 use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_read_quorum_error};
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
@@ -1372,6 +1375,13 @@ impl DefaultObjectUsecase {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
         }
 
+        let mut user_metadata = metadata.unwrap_or_default();
+        user_metadata.extend(parse_presigned_query_user_metadata(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?);
+
         let write = PutObjectWriteRequest {
             bucket: bucket.clone(),
             key,
@@ -1390,7 +1400,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key,
                 sse_customer_key_md5,
             },
-            user_metadata: metadata.unwrap_or_default(),
+            user_metadata,
             internal_metadata: HashMap::new(),
             content: PutObjectContentInput {
                 cache_control,
